@@ -35,7 +35,6 @@ LATEX_SYSTEM = (
     "Default: respond briefly and clearly. "
     "Use LaTeX for math: one display block with $$...$$ for multi-line equations and \\(...\\) for inline math. "
     "Do NOT escape punctuation/brackets inside math (write = ( ) [ ] ^ _ plainly). "
-    "Avoid layout directives like [6pt], [8pt], etc. "
     "Example: $$ I_D = \\mu_n C_{ox}\\frac{W}{L}[(V_{GS}-V_T)V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
     "Provide derivations only if asked. "
     "If the question is off-topic, reply exactly: "
@@ -64,12 +63,9 @@ class LRU(OrderedDict):
 
 answer_cache = LRU(maxsize=64)
 
-def _collapse_runs_of_backslashes(s: str) -> str:
-    """
-    Reduce ANY run of two or more backslashes to ONE backslash.
-    Handles cases like \\\\[8pt], \\begin{aligned}, \\mu -> \\, etc.
-    """
-    return re.sub(r"\\{2,}", lambda m: "\\", s)
+def _collapse_double_backslashes(s: str) -> str:
+    # \\mu -> \mu, \\frac -> \frac, etc.
+    return re.sub(r"\\\\", r"\\", s)
 
 def _fix_overescape_in_math(math: str) -> str:
     """
@@ -87,17 +83,10 @@ _MATH_INLINE  = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
 def sanitize_latex(s: str) -> str:
     """
     Make model output friendlier to MathJax:
-      • collapse ANY backslash runs globally (\\.. -> \),
-      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc. (also from \\[8pt] after collapsing),
+      • collapse double backslashes globally,
       • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
     """
-    # 1) Kill all backslash runs first (most important)
-    s = _collapse_runs_of_backslashes(s)
-
-    # 2) Remove TeX spacing hints like [6pt], [ 0.5 em ], [12mm], [8px], etc.
-    s = re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
-
-    # 3) Clean inside math blocks
+    s = _collapse_double_backslashes(s)
     def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
     def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
     s = _MATH_DISPLAY.sub(_fix_display, s)
