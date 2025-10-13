@@ -35,6 +35,7 @@ LATEX_SYSTEM = (
     "Default: respond briefly and clearly. "
     "Use LaTeX for math: one display block with $$...$$ for multi-line equations and \\(...\\) for inline math. "
     "Do NOT escape punctuation/brackets inside math (write = ( ) [ ] ^ _ plainly). "
+    "Avoid layout directives like [6pt], [8pt], etc. "
     "Example: $$ I_D = \\mu_n C_{ox}\\frac{W}{L}[(V_{GS}-V_T)V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
     "Provide derivations only if asked. "
     "If the question is off-topic, reply exactly: "
@@ -84,9 +85,14 @@ def sanitize_latex(s: str) -> str:
     """
     Make model output friendlier to MathJax:
       • collapse double backslashes globally,
+      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc.,
       • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
     """
     s = _collapse_double_backslashes(s)
+
+    # NEW: remove TeX spacing hints like [6pt], \[8pt], [12 mm], [0.5em], etc.
+    s = re.sub(r"\\?\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
+
     def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
     def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
     s = _MATH_DISPLAY.sub(_fix_display, s)
