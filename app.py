@@ -15,13 +15,13 @@ from openai import OpenAI
 # ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-# STREAMING=on -> server sends text/plain once at end (buffered for MathJax)
+# STREAMING=on -> buffer all chunks and send once (best for MathJax rendering)
 STREAMING_DEFAULT = os.getenv("STREAMING", "on").strip().lower() == "on"
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # e.g. https://moodle.yoursite.edu
 
 app = Flask(__name__)
 if FRONTEND_ORIGIN == "*":
-    CORS(app)  # permissive while debugging
+    CORS(app)  # permissive while testing
 else:
     CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
 
@@ -63,12 +63,16 @@ class LRU(OrderedDict):
 
 answer_cache = LRU(maxsize=64)
 
-# Collapse \\mu -> \mu etc.
 def _collapse_double_backslashes(s: str) -> str:
+    # \\mu -> \mu, \\frac -> \frac, etc.
     return re.sub(r"\\\\", r"\\", s)
 
-# Inside math only, remove stray backslashes before operators/brackets.
 def _fix_overescape_in_math(math: str) -> str:
+    """
+    Inside a math block only:
+    - fix \left\[ -> \left[ and \right\] -> \right]
+    - remove stray backslashes before operators/brackets: \= \( \) \[ \] \+ \- \* / ^ _
+    """
     math = math.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
     math = re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math)
     return math
@@ -157,7 +161,6 @@ def chat():
                 for event in stream:
                     if event.type == "response.output_text.delta":
                         parts.append(event.delta or "")
-                # After stream ends, sanitize once and send once
                 final_text = sanitize_latex("".join(parts))
                 yield final_text
         except Exception as e:
