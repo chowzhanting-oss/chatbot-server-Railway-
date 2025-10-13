@@ -35,6 +35,7 @@ LATEX_SYSTEM = (
     "Default: respond briefly and clearly. "
     "Use LaTeX for math: one display block with $$...$$ for multi-line equations and \\(...\\) for inline math. "
     "Do NOT escape punctuation/brackets inside math (write = ( ) [ ] ^ _ plainly). "
+    "Avoid layout directives like [6pt], [8pt], etc. "
     "Example: $$ I_D = \\mu_n C_{ox}\\frac{W}{L}[(V_{GS}-V_T)V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
     "Provide derivations only if asked. "
     "If the question is off-topic, reply exactly: "
@@ -63,9 +64,14 @@ class LRU(OrderedDict):
 
 answer_cache = LRU(maxsize=64)
 
-def _collapse_double_backslashes(s: str) -> str:
-    # \\mu -> \mu, \\frac -> \frac, etc.
-    return re.sub(r"\\\\", r"\\", s)
+# Convert \\mu, \\frac, \\left, \\[, \\] → single-backslash commands,
+# but DO NOT destroy line breaks like "\\ " or "\\\n".
+def _collapse_command_backslashes(s: str) -> str:
+    # 1) commands or bracket-delimiters following backslashes
+    s = re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
+    # 2) triple-or-more slashes → keep one plus any remaining (rare)
+    s = re.sub(r"\\{3,}", r"\\", s)
+    return s
 
 def _fix_overescape_in_math(math: str) -> str:
     """
@@ -83,10 +89,17 @@ _MATH_INLINE  = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
 def sanitize_latex(s: str) -> str:
     """
     Make model output friendlier to MathJax:
-      • collapse double backslashes globally,
+      • collapse \\ before commands/brackets, preserving real line breaks,
+      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc.,
       • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
     """
-    s = _collapse_double_backslashes(s)
+    # 1) Clean backslashes for commands (keep \\ line breaks intact)
+    s = _collapse_command_backslashes(s)
+
+    # 2) Remove TeX spacing hints like [6pt], [ 0.5 em ], [12mm], [8px], etc.
+    s = re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
+
+    # 3) Clean inside math blocks
     def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
     def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
     s = _MATH_DISPLAY.sub(_fix_display, s)
