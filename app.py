@@ -5,7 +5,7 @@ import time
 import json
 import threading
 from collections import OrderedDict
-from typing import Optional
+from typing import Optional, Tuple
 
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
@@ -15,9 +15,10 @@ from openai import OpenAI
 # Environment / Config
 # ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Tip: gpt-4o-mini tends to support JSON mode broadly; keep your default if you like.
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 STREAMING_DEFAULT = os.getenv("STREAMING", "on").strip().lower() == "on"
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # e.g. https://moodle.yoursite.edu
 
 app = Flask(__name__)
 if FRONTEND_ORIGIN == "*":
@@ -93,15 +94,115 @@ def sanitize_latex(s: str) -> str:
     s = _MATH_INLINE.sub(_fix_inline, s)
     return s
 
-def extract_json_from_responses(resp) -> str:
+def extract_json_block(text: str) -> str:
+    """
+    Try to pull the first valid-looking JSON object from a text blob.
+    """
+    if not text:
+        return ""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end+1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            pass
+    return ""
+
+def responses_result_to_text(resp) -> str:
+    # Prefer structured content path
     try:
         return resp.output[0].content[0].text
     except Exception:
         pass
+    # Fallback to flat text
     try:
         return resp.output_text or ""
     except Exception:
         return ""
+
+def call_llm_json(system_prompt: str, user_messages: list, model: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Try to get JSON via:
+      1) Responses API with response_format (if supported)
+      2) Responses API without response_format
+      3) Chat Completions (with/without response_format)
+    Returns: (json_obj or None, raw_text or None)
+    """
+    # 1) Responses with JSON mode
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[{"role": "system", "content": system_prompt}] + user_messages,
+            response_format={"type": "json_object"},
+        )
+        text = responses_result_to_text(resp)
+        try:
+            return json.loads(text), text
+        except Exception:
+            # maybe the model returned extra text — try block extraction
+            block = extract_json_block(text)
+            if block:
+                return json.loads(block), text
+            return None, text
+    except TypeError:
+        # SDK doesn't accept response_format here; continue
+        pass
+    except Exception as e:
+        # Other runtime errors; keep going to fallback
+        last_text = getattr(e, "message", str(e))
+        # don't return yet; try fallbacks
+
+    # 2) Responses without JSON mode
+    try:
+        # Strengthen the instruction to start with "{" and end with "}"
+        strengthened = user_messages + [
+            {"role": "user", "content": "Output ONLY JSON. Begin with '{' and end with '}'."}
+        ]
+        resp = client.responses.create(
+            model=model,
+            input=[{"role": "system", "content": system_prompt}] + strengthened,
+        )
+        text = responses_result_to_text(resp)
+        block = extract_json_block(text)
+        if block:
+            return json.loads(block), text
+        return None, text
+    except Exception as e:
+        last_text = getattr(e, "message", str(e))
+
+    # 3) Chat Completions fallback
+    try:
+        messages = [{"role": "system", "content": system_prompt}] + user_messages + [
+            {"role": "user", "content": "Return ONLY JSON. Start with '{' and end with '}'."}
+        ]
+        # Try with response_format if supported
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
+            text = resp.choices[0].message.content or ""
+            return json.loads(text), text
+        except TypeError:
+            # Retry without response_format
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+            )
+            text = resp.choices[0].message.content or ""
+            block = extract_json_block(text)
+            if block:
+                return json.loads(block), text
+            return None, text
+    except Exception as e:
+        last_text = getattr(e, "message", str(e))
+
+    # All attempts failed to parse JSON
+    return None, last_text if 'last_text' in locals() else None
 
 def get_payload_json() -> dict:
     """Parse JSON robustly even if Content-Type is wrong."""
@@ -153,10 +254,9 @@ def get_full_answer(question: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def handle_analyze_adaptive_quiz(payload: dict):
     """
-    Expected:
+    Payload:
       { "mode":"analyze_adaptive_quiz",
         "schema":[...], "csv":"header\\nrows...", "run_label":"..." }
-    Returns: { "run_label": "...", "items":[ ... ] }
     """
     schema = payload.get("schema") or ["userid","username","quizname","difficultysum","standarderror","measure","timetaken"]
     csv_text = (payload.get("csv") or "").strip()
@@ -195,26 +295,27 @@ CSV data:
 {csv_text}
     """.strip()
 
-    try:
-        resp = client.responses.create(
-            model=MODEL,
-            input=[
-                {"role": "system", "content": ANALYTICS_SYSTEM},  # bypass tutor guard
-                {"role": "user", "content": user_message},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-        raw_json_str = extract_json_from_responses(resp)
-        data = json.loads(raw_json_str or "{}")
-        if not isinstance(data, dict):
-            data = {}
-        data.setdefault("run_label", run_label)
-        if "items" not in data or not isinstance(data["items"], list):
-            data["items"] = []
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    json_obj, raw_text = call_llm_json(
+        system_prompt=ANALYTICS_SYSTEM,
+        user_messages=[
+            {"role": "user", "content": user_message},
+            {"role": "user", "content": prompt},
+        ],
+        model=MODEL,
+    )
+
+    if not isinstance(json_obj, dict):
+        # Return a clear error to caller with whatever text we got back.
+        return jsonify({
+            "error": "LLM_JSON_PARSE_FAILED",
+            "raw": raw_text or ""
+        }), 200
+
+    json_obj.setdefault("run_label", run_label)
+    if "items" not in json_obj or not isinstance(json_obj["items"], list):
+        json_obj["items"] = []
+
+    return jsonify(json_obj)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # /chat endpoint with robust mode switching
@@ -223,18 +324,18 @@ CSV data:
 def chat():
     payload = get_payload_json()
 
-    # Accept mode from JSON or query (fallback)
+    # Mode from JSON or query param
     mode = (payload.get("mode") or request.args.get("mode") or "chat").strip().lower()
 
-    # Extra safeguard: if it looks like an analytics request (has csv/schema), force analytics mode
+    # If it looks like analytics, force analytics mode
     if mode == "chat" and (("csv" in payload) or ("schema" in payload)):
         mode = "analyze_adaptive_quiz"
 
-    # 1) Analytics path (never stream)
+    # 1) Analytics path
     if mode == "analyze_adaptive_quiz":
         return handle_analyze_adaptive_quiz(payload)
 
-    # 2) Tutor path (electronics)
+    # 2) Tutor path
     question = (payload.get("message") or "").strip()
     if not question:
         return jsonify({"error": "Missing 'message'"}), 400
