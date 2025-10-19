@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import json
 import threading
 from collections import OrderedDict
 from typing import Optional
@@ -15,20 +16,19 @@ from openai import OpenAI
 # ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-# STREAMING=on -> buffer all chunks and send once (best for MathJax rendering)
 STREAMING_DEFAULT = os.getenv("STREAMING", "on").strip().lower() == "on"
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # e.g. https://moodle.yoursite.edu
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 
 app = Flask(__name__)
 if FRONTEND_ORIGIN == "*":
-    CORS(app)  # permissive while testing
+    CORS(app)
 else:
     CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# System prompt: on-topic + LaTeX rules
+# System prompts
 # ──────────────────────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
@@ -40,6 +40,13 @@ LATEX_SYSTEM = (
     "Provide derivations only if asked. "
     "If the question is off-topic, reply exactly: "
     "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
+)
+
+ANALYTICS_SYSTEM = (
+    "You are a strict learning analytics assistant. "
+    "You must return a single valid JSON object matching the requested schema. "
+    "Do not include any prose or commentary outside of JSON. "
+    "Be conservative with risk when confidence is low."
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -64,21 +71,12 @@ class LRU(OrderedDict):
 
 answer_cache = LRU(maxsize=64)
 
-# Convert \\mu, \\frac, \\left, \\[, \\] → single-backslash commands,
-# but DO NOT destroy line breaks like "\\ " or "\\\n".
 def _collapse_command_backslashes(s: str) -> str:
-    # 1) commands or bracket-delimiters following backslashes
     s = re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
-    # 2) triple-or-more slashes → keep one plus any remaining (rare)
     s = re.sub(r"\\{3,}", r"\\", s)
     return s
 
 def _fix_overescape_in_math(math: str) -> str:
-    """
-    Inside a math block only:
-    - fix \left\[ -> \left[ and \right\] -> \right]
-    - remove stray backslashes before operators/brackets: \= \( \) \[ \] \+ \- \* / ^ _
-    """
     math = math.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
     math = re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math)
     return math
@@ -87,26 +85,38 @@ _MATH_DISPLAY = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _MATH_INLINE  = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
 
 def sanitize_latex(s: str) -> str:
-    """
-    Make model output friendlier to MathJax:
-      • collapse \\ before commands/brackets, preserving real line breaks,
-      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc.,
-      • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
-    """
-    # 1) Clean backslashes for commands (keep \\ line breaks intact)
     s = _collapse_command_backslashes(s)
-
-    # 2) Remove TeX spacing hints like [6pt], [ 0.5 em ], [12mm], [8px], etc.
     s = re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
-
-    # 3) Clean inside math blocks
     def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
     def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
     s = _MATH_DISPLAY.sub(_fix_display, s)
     s = _MATH_INLINE.sub(_fix_inline, s)
     return s
 
-# Always include CORS headers (helps with OPTIONS / preflight)
+def extract_json_from_responses(resp) -> str:
+    try:
+        return resp.output[0].content[0].text
+    except Exception:
+        pass
+    try:
+        return resp.output_text or ""
+    except Exception:
+        return ""
+
+def get_payload_json() -> dict:
+    """Parse JSON robustly even if Content-Type is wrong."""
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+    raw = request.data or b""
+    if raw:
+        try:
+            return json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    return {}
+
+# Always include CORS headers
 @app.after_request
 def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Origin", "*" if FRONTEND_ORIGIN == "*" else FRONTEND_ORIGIN)
@@ -126,7 +136,7 @@ def ping():
     return jsonify({"status": "ok"})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Non-streaming helper
+# Tutor helper
 # ──────────────────────────────────────────────────────────────────────────────
 def get_full_answer(question: str) -> str:
     resp = client.responses.create(
@@ -139,16 +149,96 @@ def get_full_answer(question: str) -> str:
     return sanitize_latex(resp.output_text or "")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /chat endpoint
+# Analytics handler
+# ──────────────────────────────────────────────────────────────────────────────
+def handle_analyze_adaptive_quiz(payload: dict):
+    """
+    Expected:
+      { "mode":"analyze_adaptive_quiz",
+        "schema":[...], "csv":"header\\nrows...", "run_label":"..." }
+    Returns: { "run_label": "...", "items":[ ... ] }
+    """
+    schema = payload.get("schema") or ["userid","username","quizname","difficultysum","standarderror","measure","timetaken"]
+    csv_text = (payload.get("csv") or "").strip()
+    run_label = payload.get("run_label") or f"manual_{time.strftime('%Y-%m-%d')}"
+    user_message = payload.get("message") or "Analyze the CSV and return strict JSON."
+
+    if not csv_text:
+        return jsonify({"error": "Missing 'csv' content"}), 400
+
+    schema_list = ", ".join(schema)
+    prompt = f"""
+You will be given a CSV with columns: {schema_list}.
+Return a SINGLE valid JSON object with this exact shape:
+
+{{
+  "run_label": string,
+  "items": [
+    {{
+      "userid": int,
+      "risk_score": number,   // 0..100
+      "confidence": number,   // 0..1
+      "drivers": [string],    // 1-4 concise reasons
+      "student_msg": string,  // short actionable message for the student
+      "teacher_msg": string,  // short actionable message for the teacher
+      "features": object      // echo useful per-user fields (e.g., measure, timetaken, quizname)
+    }}
+  ]
+}}
+
+Rules:
+- Output ONLY JSON (no Markdown, no commentary).
+- If data is insufficient, keep risk_score ~50 and confidence low, but still produce valid JSON.
+- Aggregate rows by userid so each user appears once.
+
+CSV data:
+{csv_text}
+    """.strip()
+
+    try:
+        resp = client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": ANALYTICS_SYSTEM},  # bypass tutor guard
+                {"role": "user", "content": user_message},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        raw_json_str = extract_json_from_responses(resp)
+        data = json.loads(raw_json_str or "{}")
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("run_label", run_label)
+        if "items" not in data or not isinstance(data["items"], list):
+            data["items"] = []
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /chat endpoint with robust mode switching
 # ──────────────────────────────────────────────────────────────────────────────
 @app.post("/chat")
 def chat():
-    payload = request.get_json(silent=True) or {}
+    payload = get_payload_json()
+
+    # Accept mode from JSON or query (fallback)
+    mode = (payload.get("mode") or request.args.get("mode") or "chat").strip().lower()
+
+    # Extra safeguard: if it looks like an analytics request (has csv/schema), force analytics mode
+    if mode == "chat" and (("csv" in payload) or ("schema" in payload)):
+        mode = "analyze_adaptive_quiz"
+
+    # 1) Analytics path (never stream)
+    if mode == "analyze_adaptive_quiz":
+        return handle_analyze_adaptive_quiz(payload)
+
+    # 2) Tutor path (electronics)
     question = (payload.get("message") or "").strip()
     if not question:
         return jsonify({"error": "Missing 'message'"}), 400
 
-    # Non-streaming path (JSON)
     if not STREAMING_DEFAULT:
         cached = answer_cache.get(question)
         if cached:
@@ -160,7 +250,6 @@ def chat():
         except Exception as e:
             return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    # Streaming path (text/plain), but buffer for MathJax reliability
     def generate():
         parts = []
         try:
@@ -190,7 +279,7 @@ def chat():
 # Keep-alive (optional)
 # ──────────────────────────────────────────────────────────────────────────────
 def keep_alive():
-    url = os.getenv("SELF_PING_URL")  # e.g., https://your-app.up.railway.app
+    url = os.getenv("SELF_PING_URL")
     if not url:
         return
     try:
@@ -208,7 +297,7 @@ if os.getenv("SELF_PING_URL"):
     threading.Thread(target=keep_alive, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Local dev runner (ignored by Gunicorn in production)
+# Local dev runner
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
