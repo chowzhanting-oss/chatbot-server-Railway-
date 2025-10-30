@@ -1,186 +1,215 @@
-import os, re, time, json, threading, traceback
+# app.py
+import os
+import re
+import time
+import threading
 from collections import OrderedDict
-from typing import Optional, Tuple
+from typing import Optional
+
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
 
-# ── Config ──────────────────────────────────────────────────────────────────── 
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment / Config
+# ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # safer default
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+# STREAMING=on -> buffer all chunks and send once (best for MathJax rendering)
 STREAMING_DEFAULT = os.getenv("STREAMING", "on").strip().lower() == "on"
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "on").strip().lower() == "on"  # show trace in JSON errors
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # e.g. https://moodle.yoursite.edu
 
 app = Flask(__name__)
 if FRONTEND_ORIGIN == "*":
-    CORS(app)
+    CORS(app)  # permissive while testing
 else:
     CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ── Chatbot Section ────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# System prompt: on-topic + LaTeX rules
+# ──────────────────────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
-    "Default: respond briefly and clearly. Use LaTeX with $$...$$ for display math and \\(...\\) for inline math. "
-    "If the user greets you casually (hi, hello, hey, etc.), reply with a friendly welcome such as 'Hello! How can I help you today?'. "
-    "Only when a request is clearly outside electronics should you reply exactly: Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
+    "Default: respond briefly and clearly. "
+    "Use LaTeX for math: one display block with $$...$$ for multi-line equations and \\(...\\) for inline math. "
+    "Do NOT escape punctuation/brackets inside math (write = ( ) [ ] ^ _ plainly). "
+    "Avoid layout directives like [6pt], [8pt], etc. "
+    "Example: $$ I_D = \\mu_n C_{ox}\\frac{W}{L}[(V_{GS}-V_T)V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
+    "Provide derivations only if asked. "
+    "If the question is off-topic, reply exactly: "
+    "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
 
-def get_full_answer(question: str) -> str:
-    """ Function to get the full answer from GPT in LaTeX format """
-    resp = client.responses.create(
-        model=MODEL,
-        input=[{"role": "system", "content": LATEX_SYSTEM},
-               {"role": "user", "content": question}]
-    )
-    return resp.output_text or ""  # Return the LaTeX-formatted response
-
-@app.post("/chat")
-def chat():
-    """ Chatbot route to handle incoming messages """
-    payload = get_payload_json()
-    question = (payload.get("message") or "").strip()
-    
-    if not question:
-        return jsonify({"error": "Missing 'message'"}), 400
-    
-    # Get the LaTeX-formatted response from GPT
-    answer = get_full_answer(question)
-    
-    return jsonify({"reply": answer})
-
-
-# ── Analytics Section ──────────────────────────────────────────────────────────
-ANALYTICS_SYSTEM = (
-    "You are a strict learning analytics assistant. "
-    "Return a single valid JSON object matching the requested schema. "
-    "No prose outside JSON. Be conservative with risk when confidence is low."
-)
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities: tiny cache + LaTeX sanitizers
+# ──────────────────────────────────────────────────────────────────────────────
 class LRU(OrderedDict):
-    def __init__(self, maxsize=64): super().__init__(); self.maxsize = maxsize
+    def __init__(self, maxsize=64):
+        super().__init__()
+        self.maxsize = maxsize
     def get(self, k) -> Optional[str]:
         if k in self:
-            v = super().pop(k); super().__setitem__(k, v); return v
+            v = super().pop(k)
+            super().__setitem__(k, v)
+            return v
         return None
     def put(self, k, v):
-        if k in self: super().pop(k)
-        elif len(self) >= self.maxsize: self.popitem(last=False)
+        if k in self:
+            super().pop(k)
+        elif len(self) >= self.maxsize:
+            self.popitem(last=False)
         super().__setitem__(k, v)
 
 answer_cache = LRU(maxsize=64)
 
-def extract_json_block(text: str) -> str:
-    if not text: return ""
-    start = text.find("{"); end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        cand = text[start:end+1]
-        try: json.loads(cand); return cand
-        except: pass
-    return ""
+# Convert \\mu, \\frac, \\left, \\[, \\] → single-backslash commands,
+# but DO NOT destroy line breaks like "\\ " or "\\\n".
+def _collapse_command_backslashes(s: str) -> str:
+    # 1) commands or bracket-delimiters following backslashes
+    s = re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
+    # 2) triple-or-more slashes → keep one plus any remaining (rare)
+    s = re.sub(r"\\{3,}", r"\\", s)
+    return s
 
-def handle_analyze_adaptive_quiz(payload: dict):
+def _fix_overescape_in_math(math: str) -> str:
     """
-    Payload:
-      { "mode":"analyze_adaptive_quiz",
-        "schema":[...], "csv":"header\\nrows...", "run_label":"...", "dryrun": bool }
+    Inside a math block only:
+    - fix \left\[ -> \left[ and \right\] -> \right]
+    - remove stray backslashes before operators/brackets: \= \( \) \[ \] \+ \- \* / ^ _
     """
-    schema = payload.get("schema") or ["userid", "username", "quizname", "difficultysum", "standarderror", "measure", "timetaken"]
-    csv_text = (payload.get("csv") or "").strip()
-    run_label = payload.get("run_label") or f"manual_{time.strftime('%Y-%m-%d')}"
-    user_message = payload.get("message") or "Analyze the CSV and return strict JSON."
-    dryrun = bool(payload.get("dryrun"))
+    math = math.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
+    math = re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math)
+    return math
 
-    if not csv_text:
-        return jsonify({"error": "Missing 'csv' content"}), 400
+_MATH_DISPLAY = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
+_MATH_INLINE  = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
 
-    # DRY-RUN path to verify end-to-end without OpenAI
-    if dryrun or not OPENAI_API_KEY:
-        lines = [ln for ln in csv_text.splitlines() if ln.strip()]
-        hdr = lines[0].split(",") if lines else []
-        items = []
-        for row in lines[1:3]:  # at most 2 demo rows
-            cols = row.split(",")
-            rec = dict(zip(hdr, cols))
-            uid = int(rec.get("userid", "0") or 0)
-            items.append({
-                "userid": uid,
-                "risk_score": 50.0,
-                "confidence": 0.3,
-                "drivers": ["dryrun mode"],
-                "student_msg": "This is a dry-run preview.",
-                "teacher_msg": "Dry-run: verify data flow.",
-                "features": rec
-            })
-        return jsonify({"run_label": run_label, "items": items})
+def sanitize_latex(s: str) -> str:
+    """
+    Make model output friendlier to MathJax:
+      • collapse \\ before commands/brackets, preserving real line breaks,
+      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc.,
+      • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
+    """
+    # 1) Clean backslashes for commands (keep \\ line breaks intact)
+    s = _collapse_command_backslashes(s)
 
-    schema_list = ", ".join(schema)
-    prompt = f"""
-    You will be given a CSV with columns: {schema_list}.
-    Return a SINGLE valid JSON object with this exact shape:
-    {{
-      "run_label": string,
-      "items": [
-        {{
-          "userid": int,
-          "risk_score": number,   // 0..100
-          "confidence": number,   // 0..1
-          "drivers": [string],    // 1-4 concise reasons
-          "student_msg": string,  // short actionable message for the student
-          "teacher_msg": string,  // short actionable message for the teacher
-          "features": object      // echo useful per-user fields (e.g., measure, timetaken, quizname)
-        }}
-      ]
-    }}
+    # 2) Remove TeX spacing hints like [6pt], [ 0.5 em ], [12mm], [8px], etc.
+    s = re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
 
-    CSV data:
-    {csv_text}
-    """.strip()
+    # 3) Clean inside math blocks
+    def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
+    def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
+    s = _MATH_DISPLAY.sub(_fix_display, s)
+    s = _MATH_INLINE.sub(_fix_inline, s)
+    return s
 
-    json_obj, _ = call_llm_json(
-        system_prompt=ANALYTICS_SYSTEM,
-        user_messages=[{"role": "user", "content": user_message}, {"role": "user", "content": prompt}],
+# Always include CORS headers (helps with OPTIONS / preflight)
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*" if FRONTEND_ORIGIN == "*" else FRONTEND_ORIGIN)
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return resp
+
+@app.route("/chat", methods=["OPTIONS"])
+def chat_options():
+    return ("", 204)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/ping")
+def ping():
+    return jsonify({"status": "ok"})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Non-streaming helper
+# ──────────────────────────────────────────────────────────────────────────────
+def get_full_answer(question: str) -> str:
+    resp = client.responses.create(
         model=MODEL,
+        input=[
+            {"role": "system", "content": LATEX_SYSTEM},
+            {"role": "user", "content": question},
+        ],
     )
+    return sanitize_latex(resp.output_text or "")
 
-    if not isinstance(json_obj, dict):
-        return jsonify({"error": "LLM_JSON_PARSE_FAILED"}), 200
+# ──────────────────────────────────────────────────────────────────────────────
+# /chat endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+@app.post("/chat")
+def chat():
+    payload = request.get_json(silent=True) or {}
+    question = (payload.get("message") or "").strip()
+    if not question:
+        return jsonify({"error": "Missing 'message'"}), 400
 
-    json_obj.setdefault("run_label", run_label)
-    if "items" not in json_obj or not isinstance(json_obj["items"], list):
-        json_obj["items"] = []
+    # Non-streaming path (JSON)
+    if not STREAMING_DEFAULT:
+        cached = answer_cache.get(question)
+        if cached:
+            return jsonify({"reply": cached})
+        try:
+            answer = get_full_answer(question)
+            answer_cache.put(question, answer)
+            return jsonify({"reply": answer})
+        except Exception as e:
+            return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    return jsonify(json_obj)
+    # Streaming path (text/plain), but buffer for MathJax reliability
+    def generate():
+        parts = []
+        try:
+            with client.responses.stream(
+                model=MODEL,
+                input=[
+                    {"role": "system", "content": LATEX_SYSTEM},
+                    {"role": "user", "content": question},
+                ],
+            ) as stream:
+                for event in stream:
+                    if event.type == "response.output_text.delta":
+                        parts.append(event.delta or "")
+                final_text = sanitize_latex("".join(parts))
+                yield final_text
+        except Exception as e:
+            yield f"\n[Stream error: {type(e).__name__}: {e}]"
+        finally:
+            text = "".join(parts).strip()
+            if text:
+                answer_cache.put(question, sanitize_latex(text))
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    payload = get_payload_json()
+    return Response(stream_with_context(generate()),
+                    mimetype="text/plain; charset=utf-8")
 
-    if payload.get("mode") == "analyze_adaptive_quiz":
-        return handle_analyze_adaptive_quiz(payload)
-
-    return jsonify({"error": "Invalid mode"}), 400
-
-
-# ── Keep-alive (optional) ─────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Keep-alive (optional)
+# ──────────────────────────────────────────────────────────────────────────────
 def keep_alive():
-    url = os.getenv("SELF_PING_URL")
-    if not url: return
+    url = os.getenv("SELF_PING_URL")  # e.g., https://your-app.up.railway.app
+    if not url:
+        return
     try:
         import requests
     except Exception:
         return
     while True:
-        try: requests.get(url + "/ping", timeout=5)
-        except Exception: pass
+        try:
+            requests.get(url + "/ping", timeout=5)
+        except Exception:
+            pass
         time.sleep(600)
 
 if os.getenv("SELF_PING_URL"):
     threading.Thread(target=keep_alive, daemon=True).start()
 
-# ── Local dev runner ──────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Local dev runner (ignored by Gunicorn in production)
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
