@@ -307,8 +307,11 @@ def chat():
             ) as stream:
                 for event in stream:
                     if event.type == "response.output_text.delta":
-                        parts.append(event.delta or "")
-                yield sanitize_latex("".join(parts))
+                        # Always sanitize the new part before sending to client
+                        delta = event.delta or ""
+                        parts.append(delta)
+                        # Yield the running total, sanitized.
+                        yield sanitize_latex("".join(parts))
         except Exception as e:
             yield f"\n[Stream error: {type(e).__name__}: {e}]"
         finally:
