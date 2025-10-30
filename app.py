@@ -9,10 +9,10 @@ from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # safer default
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 STREAMING_DEFAULT = os.getenv("STREAMING", "on").strip().lower() == "on"
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "on").strip().lower() == "on"  # show trace in JSON errors
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "on").strip().lower() == "on"
 
 app = Flask(__name__)
 if FRONTEND_ORIGIN == "*":
@@ -22,7 +22,7 @@ else:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ── System prompts ────────────────────────────────────────────────────────────
+# ── System Prompts ────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
     "Default: respond briefly and clearly. Use LaTeX with $$...$$ and \\(...\\). "
@@ -34,7 +34,7 @@ ANALYTICS_SYSTEM = (
     "No prose outside JSON. Be conservative with risk when confidence is low."
 )
 
-# ── Tiny cache + LaTeX cleaners (unchanged) ───────────────────────────────────
+# ── LRU Cache ────────────────────────────────────────────────────────────────
 class LRU(OrderedDict):
     def __init__(self, maxsize=64): super().__init__(); self.maxsize = maxsize
     def get(self, k) -> Optional[str]:
@@ -48,20 +48,15 @@ class LRU(OrderedDict):
 
 answer_cache = LRU(maxsize=64)
 
-import re as _re
-def _collapse_command_backslashes(s: str) -> str:
-    s = _re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
-    s = _re.sub(r"\\{3,}", r"\\", s); return s
-def _fix_overescape_in_math(math: str) -> str:
-    math = math.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
-    math = _re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math); return math
-_MATH_DISPLAY = _re.compile(r"\$\$(.*?)\$\$", _re.DOTALL)
-_MATH_INLINE  = _re.compile(r"\\\((.*?)\\\)", _re.DOTALL)
+# ── LaTeX Sanitizers ─────────────────────────────────────────────────────────
 def sanitize_latex(s: str) -> str:
-    s = _collapse_command_backslashes(s)
-    s = _re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
-    s = _MATH_DISPLAY.sub(lambda m: "$$"+_fix_overescape_in_math(m.group(1))+"$$", s)
-    s = _MATH_INLINE.sub (lambda m: r"\("+_fix_overescape_in_math(m.group(1))+r"\)", s)
+    if not s: return ""
+    # fix escaped characters from JSON/text issues
+    s = s.replace("\\$", "$").replace("\\\\\\", "\\\\")
+    s = re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
+    s = re.sub(r"\\{3,}", r"\\", s)
+    s = re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", s)
+    s = s.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
     return s
 
 def extract_json_block(text: str) -> str:
@@ -88,7 +83,7 @@ def get_payload_json() -> dict:
         except Exception: pass
     return {}
 
-# ── CORS / health / error handling ────────────────────────────────────────────
+# ── Error Handling / Ping ────────────────────────────────────────────────────
 @app.after_request
 def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Origin", "*" if FRONTEND_ORIGIN == "*" else FRONTEND_ORIGIN)
@@ -104,14 +99,13 @@ def ping(): return jsonify({"status": "ok"})
 
 @app.errorhandler(Exception)
 def handle_any_error(e):
-    # Ensure 500s are returned as JSON, not HTML
     tb = traceback.format_exc()
     print(tb, flush=True)
     payload = {"error": f"{type(e).__name__}: {e}"}
     if DEBUG_ERRORS: payload["trace"] = tb
     return jsonify(payload), 500
 
-# ── Tutor helper ──────────────────────────────────────────────────────────────
+# ── Tutor Mode ───────────────────────────────────────────────────────────────
 def get_full_answer(question: str) -> str:
     resp = client.responses.create(
         model=MODEL,
@@ -122,9 +116,50 @@ def get_full_answer(question: str) -> str:
     )
     return sanitize_latex(resp.output_text or "")
 
-# ── LLM JSON shim (handles SDK differences) ───────────────────────────────────
+@app.post("/chat")
+def chat():
+    payload = get_payload_json()
+    question = (payload.get("message") or "").strip()
+
+    if not question:
+        return jsonify({"error": "Missing 'message'"}), 400
+
+    # Check cache
+    cached = answer_cache.get(question)
+    if cached: return jsonify({"reply": cached})
+
+    # Non-streaming answer path
+    if not STREAMING_DEFAULT:
+        ans = get_full_answer(question)
+        answer_cache.put(question, ans)
+        return jsonify({"reply": ans})
+
+    # Streaming mode
+    def generate():
+        parts = []
+        try:
+            with client.responses.stream(
+                model=MODEL,
+                input=[
+                    {"role": "system", "content": LATEX_SYSTEM},
+                    {"role": "user", "content": question},
+                ],
+            ) as stream:
+                for event in stream:
+                    if event.type == "response.output_text.delta":
+                        parts.append(event.delta or "")
+                        yield sanitize_latex(event.delta or "")
+        except Exception as e:
+            yield f"\n[Stream error: {type(e).__name__}: {e}]"
+        finally:
+            text = "".join(parts).strip()
+            if text:
+                answer_cache.put(question, sanitize_latex(text))
+
+    return Response(stream_with_context(generate()), mimetype="text/plain; charset=utf-8")
+
+# ── JSON Mode Helper ─────────────────────────────────────────────────────────
 def call_llm_json(system_prompt: str, user_messages: list, model: str) -> Tuple[Optional[dict], Optional[str]]:
-    # 1) Responses with response_format
     try:
         resp = client.responses.create(
             model=model,
@@ -133,53 +168,15 @@ def call_llm_json(system_prompt: str, user_messages: list, model: str) -> Tuple[
         )
         text = responses_result_to_text(resp)
         try: return json.loads(text), text
-        except: 
-            block = extract_json_block(text)
-            if block: return json.loads(block), text
-    except TypeError:
-        pass
-    except Exception as e:
-        print("Responses+json_object error:", e, flush=True)
-
-    # 2) Responses without response_format
-    try:
-        strengthened = user_messages + [{"role": "user", "content": "Output ONLY JSON. Begin with '{' and end with '}'."}]
-        resp = client.responses.create(
-            model=model,
-            input=[{"role": "system", "content": system_prompt}] + strengthened,
-        )
-        text = responses_result_to_text(resp)
-        block = extract_json_block(text)
-        if block: return json.loads(block), text
-    except Exception as e:
-        print("Responses (no json mode) error:", e, flush=True)
-
-    # 3) Chat completions fallback
-    try:
-        msgs = [{"role": "system", "content": system_prompt}] + user_messages + [
-            {"role": "user", "content": "Return ONLY JSON. Start with '{' and end with '}'."}
-        ]
-        try:
-            resp = client.chat.completions.create(model=model, messages=msgs, response_format={"type": "json_object"})
-            text = resp.choices[0].message.content or ""
-            return json.loads(text), text
-        except TypeError:
-            resp = client.chat.completions.create(model=model, messages=msgs)
-            text = resp.choices[0].message.content or ""
+        except:
             block = extract_json_block(text)
             if block: return json.loads(block), text
     except Exception as e:
-        print("ChatCompletions error:", e, flush=True)
-
+        print("JSON call error:", e, flush=True)
     return None, None
 
-# ── Analytics handler ─────────────────────────────────────────────────────────
+# ── Analytics Handler ────────────────────────────────────────────────────────
 def handle_analyze_adaptive_quiz(payload: dict):
-    """
-    Payload:
-      { "mode":"analyze_adaptive_quiz",
-        "schema":[...], "csv":"header\\nrows...", "run_label":"...", "dryrun": bool }
-    """
     schema = payload.get("schema") or ["userid","username","quizname","difficultysum","standarderror","measure","timetaken"]
     csv_text = (payload.get("csv") or "").strip()
     run_label = payload.get("run_label") or f"manual_{time.strftime('%Y-%m-%d')}"
@@ -189,13 +186,12 @@ def handle_analyze_adaptive_quiz(payload: dict):
     if not csv_text:
         return jsonify({"error": "Missing 'csv' content"}), 400
 
-    # DRY-RUN path to verify end-to-end without OpenAI
+    # Dry-run preview
     if dryrun or not OPENAI_API_KEY:
-        # Build a tiny fake output using just the header + first data row (if present)
         lines = [ln for ln in csv_text.splitlines() if ln.strip()]
         hdr = lines[0].split(",") if lines else []
         items = []
-        for row in lines[1:3]:  # at most 2 demo rows
+        for row in lines[1:3]:
             cols = row.split(",")
             rec = dict(zip(hdr, cols))
             uid = int(rec.get("userid", "0") or 0)
@@ -213,31 +209,29 @@ def handle_analyze_adaptive_quiz(payload: dict):
     schema_list = ", ".join(schema)
     prompt = f"""
 You will be given a CSV with columns: {schema_list}.
-Return a SINGLE valid JSON object with this exact shape:
+Return a SINGLE valid JSON object with this shape:
 
 {{
   "run_label": string,
   "items": [
     {{
       "userid": int,
-      "risk_score": number,   // 0..100
-      "confidence": number,   // 0..1
-      "drivers": [string],    // 1-4 concise reasons
-      "student_msg": string,  // short actionable message for the student
-      "teacher_msg": string,  // short actionable message for the teacher
-      "features": object      // echo useful per-user fields (e.g., measure, timetaken, quizname)
+      "risk_score": number,
+      "confidence": number,
+      "drivers": [string],
+      "student_msg": string,
+      "teacher_msg": string,
+      "features": object
     }}
   ]
 }}
-
 Rules:
-- Output ONLY JSON (no Markdown, no commentary).
-- If data is insufficient, keep risk_score ~50 and confidence low, but still produce valid JSON.
-- Aggregate rows by userid so each user appears once.
-
+- Output ONLY JSON.
+- If data is insufficient, keep risk_score ~50 and confidence low.
+- Aggregate rows by userid.
 CSV data:
 {csv_text}
-    """.strip()
+""".strip()
 
     json_obj, _ = call_llm_json(
         system_prompt=ANALYTICS_SYSTEM,
@@ -257,54 +251,13 @@ CSV data:
 
     return jsonify(json_obj)
 
-# ── /chat with robust mode switching ──────────────────────────────────────────
-@app.post("/chat")
-def chat():
+# ── Dedicated Analytics Endpoint ─────────────────────────────────────────────
+@app.post("/analyze")
+def analyze():
     payload = get_payload_json()
-    mode = (payload.get("mode") or request.args.get("mode") or "chat").strip().lower()
+    return handle_analyze_adaptive_quiz(payload)
 
-    # If it looks like analytics (csv/schema present), force analytics mode
-    if mode == "chat" and (("csv" in payload) or ("schema" in payload)):
-        mode = "analyze_adaptive_quiz"
-
-    if mode == "analyze_adaptive_quiz":
-        return handle_analyze_adaptive_quiz(payload)
-
-    # Tutor path
-    question = (payload.get("message") or "").strip()
-    if not question:
-        return jsonify({"error": "Missing 'message'"}), 400
-
-    if not STREAMING_DEFAULT:
-        cached = answer_cache.get(question)
-        if cached: return jsonify({"reply": cached})
-        ans = get_full_answer(question)
-        answer_cache.put(question, ans)
-        return jsonify({"reply": ans})
-
-    def generate():
-        parts = []
-        try:
-            with client.responses.stream(
-                model=MODEL,
-                input=[
-                    {"role": "system", "content": LATEX_SYSTEM},
-                    {"role": "user", "content": question},
-                ],
-            ) as stream:
-                for event in stream:
-                    if event.type == "response.output_text.delta":
-                        parts.append(event.delta or "")
-                yield sanitize_latex("".join(parts))
-        except Exception as e:
-            yield f"\n[Stream error: {type(e).__name__}: {e}]"
-        finally:
-            text = "".join(parts).strip()
-            if text: answer_cache.put(question, sanitize_latex(text))
-
-    return Response(stream_with_context(generate()), mimetype="text/plain; charset=utf-8")
-
-# ── Keep-alive (optional) ─────────────────────────────────────────────────────
+# ── Keep Alive ───────────────────────────────────────────────────────────────
 def keep_alive():
     url = os.getenv("SELF_PING_URL")
     if not url: return
@@ -320,7 +273,7 @@ def keep_alive():
 if os.getenv("SELF_PING_URL"):
     threading.Thread(target=keep_alive, daemon=True).start()
 
-# ── Local dev runner ──────────────────────────────────────────────────────────
+# ── Local Run ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
