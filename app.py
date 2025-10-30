@@ -25,9 +25,8 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ── System prompts ────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
-    "Default: respond briefly and clearly. Use LaTeX with $$...$$ for display math and \\(...\\) for inline math. "
-    "If the user greets you casually (hi, hello, hey, etc.), reply with a friendly welcome such as 'Hello! How can I help you today?'. "
-    "Only when a request is clearly outside electronics should you reply exactly: Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
+    "Default: respond briefly and clearly. Use LaTeX with $$...$$ and \\(...\\). "
+    "If off-topic, reply exactly: Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
 ANALYTICS_SYSTEM = (
     "You are a strict learning analytics assistant. "
@@ -58,14 +57,11 @@ def _fix_overescape_in_math(math: str) -> str:
     math = _re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math); return math
 _MATH_DISPLAY = _re.compile(r"\$\$(.*?)\$\$", _re.DOTALL)
 _MATH_INLINE  = _re.compile(r"\\\((.*?)\\\)", _re.DOTALL)
-_MATH_SINGLE_DOLLAR = _re.compile(r"(?<!\$)\$(?!\$)([\s\S]*?)(?<!\$)\$(?!\$)")
 def sanitize_latex(s: str) -> str:
     s = _collapse_command_backslashes(s)
     s = _re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
     s = _MATH_DISPLAY.sub(lambda m: "$$"+_fix_overescape_in_math(m.group(1))+"$$", s)
     s = _MATH_INLINE.sub (lambda m: r"\("+_fix_overescape_in_math(m.group(1))+r"\)", s)
-    # Convert single-dollar inline math to \( ... \) for consistent rendering
-    s = _MATH_SINGLE_DOLLAR.sub(lambda m: r"\(" + _fix_overescape_in_math(m.group(1)).strip() + r"\)", s)
     return s
 
 def extract_json_block(text: str) -> str:
@@ -279,30 +275,34 @@ def chat():
     if not question:
         return jsonify({"error": "Missing 'message'"}), 400
 
-    # Friendly greeting handling for casual openers
-    lower_q = question.lower()
-    if re.match(r"^(\s*(hi|hello|hey|yo|hiya|howdy|good\s*(morning|afternoon|evening))\s*[!.?']*)$", lower_q):
-        greeting_reply = "Hello! How can I help you today?"
-        if not STREAMING_DEFAULT:
-            answer_cache.put(question, greeting_reply)
-            return jsonify({"reply": greeting_reply})
-        return Response(greeting_reply, mimetype="text/markdown; charset=utf-8")
-
     if not STREAMING_DEFAULT:
         cached = answer_cache.get(question)
-        if cached:
-            return jsonify({"reply": cached})
+        if cached: return jsonify({"reply": cached})
         ans = get_full_answer(question)
         answer_cache.put(question, ans)
         return jsonify({"reply": ans})
 
-    # Always use non-streaming mode for LaTeX/MathJax compatibility
-    cached = answer_cache.get(question)
-    if cached:
-        return jsonify({"reply": cached})
-    ans = get_full_answer(question)
-    answer_cache.put(question, ans)
-    return jsonify({"reply": ans})
+    def generate():
+        parts = []
+        try:
+            with client.responses.stream(
+                model=MODEL,
+                input=[
+                    {"role": "system", "content": LATEX_SYSTEM},
+                    {"role": "user", "content": question},
+                ],
+            ) as stream:
+                for event in stream:
+                    if event.type == "response.output_text.delta":
+                        parts.append(event.delta or "")
+                yield sanitize_latex("".join(parts))
+        except Exception as e:
+            yield f"\n[Stream error: {type(e).__name__}: {e}]"
+        finally:
+            text = "".join(parts).strip()
+            if text: answer_cache.put(question, sanitize_latex(text))
+
+    return Response(stream_with_context(generate()), mimetype="text/plain; charset=utf-8")
 
 # ── Keep-alive (optional) ─────────────────────────────────────────────────────
 def keep_alive():
