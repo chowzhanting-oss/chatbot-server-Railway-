@@ -25,7 +25,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ── System prompts ────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
-    "Default: respond briefly and clearly. Use LaTeX with $$...$$ for display math and \\(...\\) for inline math. "
+    "Default: respond briefly and clearly. Use MathML (<math>...</math>) for all mathematical expressions. "
     "If the user greets you casually (hi, hello, hey, etc.), reply with a friendly welcome such as 'Hello! How can I help you today?'. "
     "Only when a request is clearly outside electronics should you reply exactly: Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
@@ -119,12 +119,10 @@ def handle_any_error(e):
 def get_full_answer(question: str) -> str:
     resp = client.responses.create(
         model=MODEL,
-        input=[
-            {"role": "system", "content": LATEX_SYSTEM},
-            {"role": "user", "content": question},
-        ],
+        input=[{"role": "system", "content": LATEX_SYSTEM},
+               {"role": "user", "content": question}]
     )
-    return sanitize_latex(resp.output_text or "")
+    return resp.output_text or ""  # No need to sanitize LaTeX anymore
 
 # ── LLM JSON shim (handles SDK differences) ───────────────────────────────────
 def call_llm_json(system_prompt: str, user_messages: list, model: str) -> Tuple[Optional[dict], Optional[str]]:
