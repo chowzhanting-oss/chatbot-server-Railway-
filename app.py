@@ -290,33 +290,19 @@ def chat():
 
     if not STREAMING_DEFAULT:
         cached = answer_cache.get(question)
-        if cached: return jsonify({"reply": cached})
+        if cached:
+            return jsonify({"reply": cached})
         ans = get_full_answer(question)
         answer_cache.put(question, ans)
         return jsonify({"reply": ans})
 
-    def generate():
-        parts = []
-        try:
-            with client.responses.stream(
-                model=MODEL,
-                input=[
-                    {"role": "system", "content": LATEX_SYSTEM},
-                    {"role": "user", "content": question},
-                ],
-            ) as stream:
-                for event in stream:
-                    if event.type == "response.output_text.delta":
-                        delta = event.delta or ""
-                        yield sanitize_latex(delta)
-                        parts.append(delta)
-        except Exception as e:
-            yield f"\n[Stream error: {type(e).__name__}: {e}]"
-        finally:
-            text = "".join(parts).strip()
-            if text: answer_cache.put(question, sanitize_latex(text))
-
-    return Response(stream_with_context(generate()), mimetype="text/markdown; charset=utf-8")
+    # Always use non-streaming mode for LaTeX/MathJax compatibility
+    cached = answer_cache.get(question)
+    if cached:
+        return jsonify({"reply": cached})
+    ans = get_full_answer(question)
+    answer_cache.put(question, ans)
+    return jsonify({"reply": ans})
 
 # ── Keep-alive (optional) ─────────────────────────────────────────────────────
 def keep_alive():
