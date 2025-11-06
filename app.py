@@ -39,6 +39,7 @@ LATEX_SYSTEM = (
     "Example: $$ I_D = \\mu_n C_{ox}\\frac{W}{L}[(V_{GS}-V_T)V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
     "Provide derivations only if asked. "
     "If the question is off-topic, reply exactly: "
+    "Be Polite"
     "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
 
@@ -213,3 +214,4 @@ if os.getenv("SELF_PING_URL"):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
