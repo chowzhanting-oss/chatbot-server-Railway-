@@ -32,14 +32,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ──────────────────────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
-    "Default: respond briefly and clearly. "
-    "Use LaTeX for math: one display block with $$...$$ for multi-line equations and \\(...\\) for inline math. "
-    "Do NOT escape punctuation/brackets inside math (write = ( ) [ ] ^ _ plainly). "
-    "Avoid layout directives like [6pt], [8pt], etc. "
-    "Example: $$ I_D = \\mu_n C_{ox}\\frac{W}{L}[(V_{GS}-V_T)V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
+    "Respond in point form"
     "Provide derivations only if asked. "
     "If the question is off-topic, reply exactly: "
-    "Reply in point form and do not include mathematical equations"
     "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
 
@@ -214,6 +209,7 @@ if os.getenv("SELF_PING_URL"):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
