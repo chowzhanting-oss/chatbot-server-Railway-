@@ -48,12 +48,14 @@ class LRU(OrderedDict):
     def __init__(self, maxsize=64):
         super().__init__()
         self.maxsize = maxsize
+
     def get(self, k) -> Optional[str]:
         if k in self:
             v = super().pop(k)
             super().__setitem__(k, v)
             return v
         return None
+
     def put(self, k, v):
         if k in self:
             super().pop(k)
@@ -90,7 +92,7 @@ def sanitize_latex(s: str) -> str:
     return s
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Text formatting: remove bullets + justify paragraphs (safe)
+# Text formatting: remove bullets + split dense paragraphs + justify safely
 # ──────────────────────────────────────────────────────────────────────────────
 JUSTIFY_WIDTH = 80
 
@@ -136,15 +138,50 @@ def justify_text(text: str) -> str:
             output.append(stripped)
             continue
 
-        # Only justify if it's a normal paragraph line and justification won't collapse spaces
         total_chars = sum(len(w) for w in words)
         if total_chars < JUSTIFY_WIDTH and (total_chars + (len(words) - 1)) >= JUSTIFY_WIDTH:
             output.append(_justify_paragraph(words, JUSTIFY_WIDTH))
         else:
-            # Keep original spacing (single spaces) for short/long lines
             output.append(" ".join(words))
 
     return "\n".join(output)
+
+def split_long_paragraphs(text: str, max_len: int = 300) -> str:
+    """
+    Split overly dense paragraphs into multiple paragraphs at sentence boundaries
+    for readability, while avoiding interference with MathJax/LaTeX.
+    """
+    paragraphs = text.split("\n\n")
+    new_paragraphs = []
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+
+        # Don't touch math-heavy paragraphs
+        if len(p) <= max_len or "$" in p or r"\(" in p or r"\)" in p:
+            new_paragraphs.append(p)
+            continue
+
+        # Split by sentence boundaries.
+        sentences = re.split(r"(?<=[.!?])\s+", p)
+        chunk = ""
+        for s in sentences:
+            if not s:
+                continue
+            if not chunk:
+                chunk = s
+                continue
+            if len(chunk) + 1 + len(s) <= max_len:
+                chunk += " " + s
+            else:
+                new_paragraphs.append(chunk)
+                chunk = s
+        if chunk:
+            new_paragraphs.append(chunk)
+
+    return "\n\n".join(new_paragraphs)
 
 def format_reply(s: str) -> str:
     s = (s or "").strip()
@@ -157,6 +194,9 @@ def format_reply(s: str) -> str:
     # Normalize blank lines
     s = re.sub(r"\n{3,}", "\n\n", s)
 
+    # NEW: Split dense paragraphs into multiple paragraphs
+    s = split_long_paragraphs(s)
+
     # Justify safely
     s = justify_text(s)
 
@@ -167,7 +207,10 @@ def format_reply(s: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_cors_headers(resp):
-    resp.headers.setdefault("Access-Control-Allow-Origin", "*" if FRONTEND_ORIGIN == "*" else FRONTEND_ORIGIN)
+    resp.headers.setdefault(
+        "Access-Control-Allow-Origin",
+        "*" if FRONTEND_ORIGIN == "*" else FRONTEND_ORIGIN
+    )
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     return resp
@@ -236,8 +279,10 @@ def chat():
             if text:
                 answer_cache.put(question, format_reply(sanitize_latex(text)))
 
-    return Response(stream_with_context(generate()),
-                    mimetype="text/plain; charset=utf-8")
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/plain; charset=utf-8"
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Keep-alive
