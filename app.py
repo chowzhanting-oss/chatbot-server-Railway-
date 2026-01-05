@@ -28,18 +28,20 @@ else:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# System prompt: on-topic + LaTeX rules
+# System prompt: on-topic + LaTeX rules + concise, nicely formatted output
 # ──────────────────────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
-    "Respond in point form"
+    "Be concise and cost-efficient: answer with the minimum words needed to fully answer the question, without omitting crucial information. "
+    "Do not add extra background unless it is necessary to understand the answer. "
     "Provide derivations only if asked. "
+    "Format in short, clean paragraphs (no bullet lists). Avoid leading hyphens and list markers. "
     "If the question is off-topic, reply exactly: "
     "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities: tiny cache + LaTeX sanitizers
+# Utilities: tiny cache + LaTeX sanitizers + reply formatter
 # ──────────────────────────────────────────────────────────────────────────────
 class LRU(OrderedDict):
     def __init__(self, maxsize=64):
@@ -102,6 +104,26 @@ def sanitize_latex(s: str) -> str:
     s = _MATH_INLINE.sub(_fix_inline, s)
     return s
 
+def format_reply(s: str) -> str:
+    """
+    Reduce "hyphen/bullet" formatting and paragraph nicely without deleting content.
+    Keeps LaTeX untouched (we call this after sanitize_latex).
+    """
+    s = (s or "").strip()
+    if not s:
+        return s
+
+    # Remove common leading list markers at start of lines: -, •, *, en dash/em dash
+    s = re.sub(r"(?m)^\s*(?:[-•*–—]\s+)+", "", s)
+
+    # Convert multiple consecutive blank lines into exactly one blank line
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    # Trim trailing spaces per line
+    s = re.sub(r"(?m)[ \t]+$", "", s)
+
+    return s.strip()
+
 # Always include CORS headers (helps with OPTIONS / preflight)
 @app.after_request
 def add_cors_headers(resp):
@@ -132,7 +154,7 @@ def get_full_answer(question: str) -> str:
             {"role": "user", "content": question},
         ],
     )
-    return sanitize_latex(resp.output_text or "")
+    return format_reply(sanitize_latex(resp.output_text or ""))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # /chat endpoint
@@ -170,14 +192,14 @@ def chat():
                 for event in stream:
                     if event.type == "response.output_text.delta":
                         parts.append(event.delta or "")
-                final_text = sanitize_latex("".join(parts))
+                final_text = format_reply(sanitize_latex("".join(parts)))
                 yield final_text
         except Exception as e:
             yield f"\n[Stream error: {type(e).__name__}: {e}]"
         finally:
             text = "".join(parts).strip()
             if text:
-                answer_cache.put(question, sanitize_latex(text))
+                answer_cache.put(question, format_reply(sanitize_latex(text)))
 
     return Response(stream_with_context(generate()),
                     mimetype="text/plain; charset=utf-8")
@@ -209,7 +231,3 @@ if os.getenv("SELF_PING_URL"):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-
-
