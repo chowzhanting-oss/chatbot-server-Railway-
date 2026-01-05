@@ -15,33 +15,34 @@ from openai import OpenAI
 # ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-# STREAMING=on -> buffer all chunks and send once (best for MathJax rendering)
 STREAMING_DEFAULT = os.getenv("STREAMING", "on").strip().lower() == "on"
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # e.g. https://moodle.yoursite.edu
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 
 app = Flask(__name__)
 if FRONTEND_ORIGIN == "*":
-    CORS(app)  # permissive while testing
+    CORS(app)
 else:
     CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# System prompt: on-topic + LaTeX rules + concise, nicely formatted output
+# System prompt: concise, paragraph-based, no hyphens
 # ──────────────────────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
-    "You are a patient electronics tutor for Integrated Electronics (CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
-    "Be concise and cost-efficient: answer with the minimum words needed to fully answer the question, without omitting crucial information. "
-    "Do not add extra background unless it is necessary to understand the answer. "
-    "Provide derivations only if asked. "
-    "Format in short, clean paragraphs (no bullet lists). Avoid leading hyphens and list markers. "
+    "You are a patient electronics tutor for Integrated Electronics "
+    "(CMOS, MOSFETs, amplifiers, threshold voltage, etc.). "
+    "Be concise and cost-efficient. Use the minimum words needed to fully answer the question "
+    "without omitting crucial information. "
+    "Do not add background unless required. "
+    "Provide derivations only if explicitly asked. "
+    "Write in short, clean paragraphs. Do not use bullet points or hyphenated lists. "
     "If the question is off-topic, reply exactly: "
     "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities: tiny cache + LaTeX sanitizers + reply formatter
+# Utilities: cache
 # ──────────────────────────────────────────────────────────────────────────────
 class LRU(OrderedDict):
     def __init__(self, maxsize=64):
@@ -62,21 +63,15 @@ class LRU(OrderedDict):
 
 answer_cache = LRU(maxsize=64)
 
-# Convert \\mu, \\frac, \\left, \\[, \\] → single-backslash commands,
-# but DO NOT destroy line breaks like "\\ " or "\\\n".
+# ──────────────────────────────────────────────────────────────────────────────
+# LaTeX sanitizers
+# ──────────────────────────────────────────────────────────────────────────────
 def _collapse_command_backslashes(s: str) -> str:
-    # 1) commands or bracket-delimiters following backslashes
     s = re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
-    # 2) triple-or-more slashes → keep one plus any remaining (rare)
     s = re.sub(r"\\{3,}", r"\\", s)
     return s
 
 def _fix_overescape_in_math(math: str) -> str:
-    """
-    Inside a math block only:
-    - fix \left\[ -> \left[ and \right\] -> \right]
-    - remove stray backslashes before operators/brackets: \= \( \) \[ \] \+ \- \* / ^ _
-    """
     math = math.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
     math = re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math)
     return math
@@ -85,46 +80,69 @@ _MATH_DISPLAY = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _MATH_INLINE  = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
 
 def sanitize_latex(s: str) -> str:
-    """
-    Make model output friendlier to MathJax:
-      • collapse \\ before commands/brackets, preserving real line breaks,
-      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc.,
-      • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
-    """
-    # 1) Clean backslashes for commands (keep \\ line breaks intact)
     s = _collapse_command_backslashes(s)
-
-    # 2) Remove TeX spacing hints like [6pt], [ 0.5 em ], [12mm], [8px], etc.
     s = re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
 
-    # 3) Clean inside math blocks
     def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
     def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
     s = _MATH_DISPLAY.sub(_fix_display, s)
     s = _MATH_INLINE.sub(_fix_inline, s)
     return s
 
-def format_reply(s: str) -> str:
-    """
-    Reduce "hyphen/bullet" formatting and paragraph nicely without deleting content.
-    Keeps LaTeX untouched (we call this after sanitize_latex).
-    """
-    s = (s or "").strip()
-    if not s:
-        return s
+# ──────────────────────────────────────────────────────────────────────────────
+# Text formatting: remove bullets + justify paragraphs
+# ──────────────────────────────────────────────────────────────────────────────
+JUSTIFY_WIDTH = 80
 
-    # Remove common leading list markers at start of lines: -, •, *, en dash/em dash
+def _justify_paragraph(words, width):
+    if len(words) == 1:
+        return words[0]
+    total_chars = sum(len(w) for w in words)
+    spaces_needed = width - total_chars
+    gaps = len(words) - 1
+    space, extra = divmod(spaces_needed, gaps)
+
+    line = ""
+    for i, word in enumerate(words[:-1]):
+        line += word
+        line += " " * (space + (1 if i < extra else 0))
+    return line + words[-1]
+
+def justify_text(text: str) -> str:
+    lines = text.split("\n")
+    output = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Skip empty lines or LaTeX/math lines
+        if not stripped or "$" in stripped or r"\(" in stripped or r"\)" in stripped:
+            output.append(line)
+            continue
+
+        words = stripped.split()
+        if sum(len(w) for w in words) + len(words) - 1 >= JUSTIFY_WIDTH:
+            output.append(_justify_paragraph(words, JUSTIFY_WIDTH))
+        else:
+            output.append(stripped)
+
+    return "\n".join(output)
+
+def format_reply(s: str) -> str:
+    s = (s or "").strip()
+
+    # Remove bullet / hyphen prefixes
     s = re.sub(r"(?m)^\s*(?:[-•*–—]\s+)+", "", s)
 
-    # Convert multiple consecutive blank lines into exactly one blank line
+    # Normalize blank lines
     s = re.sub(r"\n{3,}", "\n\n", s)
 
-    # Trim trailing spaces per line
-    s = re.sub(r"(?m)[ \t]+$", "", s)
-
+    s = justify_text(s)
     return s.strip()
 
-# Always include CORS headers (helps with OPTIONS / preflight)
+# ──────────────────────────────────────────────────────────────────────────────
+# CORS
+# ──────────────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Origin", "*" if FRONTEND_ORIGIN == "*" else FRONTEND_ORIGIN)
@@ -166,19 +184,14 @@ def chat():
     if not question:
         return jsonify({"error": "Missing 'message'"}), 400
 
-    # Non-streaming path (JSON)
     if not STREAMING_DEFAULT:
         cached = answer_cache.get(question)
         if cached:
             return jsonify({"reply": cached})
-        try:
-            answer = get_full_answer(question)
-            answer_cache.put(question, answer)
-            return jsonify({"reply": answer})
-        except Exception as e:
-            return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        answer = get_full_answer(question)
+        answer_cache.put(question, answer)
+        return jsonify({"reply": answer})
 
-    # Streaming path (text/plain), but buffer for MathJax reliability
     def generate():
         parts = []
         try:
@@ -205,10 +218,10 @@ def chat():
                     mimetype="text/plain; charset=utf-8")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Keep-alive (optional)
+# Keep-alive
 # ──────────────────────────────────────────────────────────────────────────────
 def keep_alive():
-    url = os.getenv("SELF_PING_URL")  # e.g., https://your-app.up.railway.app
+    url = os.getenv("SELF_PING_URL")
     if not url:
         return
     try:
@@ -226,7 +239,7 @@ if os.getenv("SELF_PING_URL"):
     threading.Thread(target=keep_alive, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Local dev runner (ignored by Gunicorn in production)
+# Local dev
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
