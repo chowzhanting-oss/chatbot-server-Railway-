@@ -90,17 +90,28 @@ def sanitize_latex(s: str) -> str:
     return s
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Text formatting: remove bullets + justify paragraphs
+# Text formatting: remove bullets + justify paragraphs (safe)
 # ──────────────────────────────────────────────────────────────────────────────
 JUSTIFY_WIDTH = 80
 
 def _justify_paragraph(words, width):
     if len(words) == 1:
         return words[0]
+
     total_chars = sum(len(w) for w in words)
-    spaces_needed = width - total_chars
     gaps = len(words) - 1
+
+    # If words alone exceed width, justification is impossible without squeezing spaces to 0.
+    # Keep normal single spaces.
+    if total_chars >= width or gaps <= 0:
+        return " ".join(words)
+
+    spaces_needed = width - total_chars
     space, extra = divmod(spaces_needed, gaps)
+
+    # Guarantee at least 1 space per gap for readability
+    if space <= 0:
+        return " ".join(words)
 
     line = ""
     for i, word in enumerate(words[:-1]):
@@ -115,21 +126,30 @@ def justify_text(text: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        # Skip empty lines or LaTeX/math lines
+        # Preserve empty lines and math-ish lines exactly (avoid breaking MathJax)
         if not stripped or "$" in stripped or r"\(" in stripped or r"\)" in stripped:
             output.append(line)
             continue
 
         words = stripped.split()
-        if sum(len(w) for w in words) + len(words) - 1 >= JUSTIFY_WIDTH:
+        if not words:
+            output.append(stripped)
+            continue
+
+        # Only justify if it's a normal paragraph line and justification won't collapse spaces
+        total_chars = sum(len(w) for w in words)
+        if total_chars < JUSTIFY_WIDTH and (total_chars + (len(words) - 1)) >= JUSTIFY_WIDTH:
             output.append(_justify_paragraph(words, JUSTIFY_WIDTH))
         else:
-            output.append(stripped)
+            # Keep original spacing (single spaces) for short/long lines
+            output.append(" ".join(words))
 
     return "\n".join(output)
 
 def format_reply(s: str) -> str:
     s = (s or "").strip()
+    if not s:
+        return s
 
     # Remove bullet / hyphen prefixes
     s = re.sub(r"(?m)^\s*(?:[-•*–—]\s+)+", "", s)
@@ -137,7 +157,9 @@ def format_reply(s: str) -> str:
     # Normalize blank lines
     s = re.sub(r"\n{3,}", "\n\n", s)
 
+    # Justify safely
     s = justify_text(s)
+
     return s.strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
