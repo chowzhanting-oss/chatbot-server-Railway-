@@ -27,7 +27,7 @@ else:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# System prompt: concise, paragraph-based, no hyphens
+# System prompt: concise + clean LaTeX rules
 # ──────────────────────────────────────────────────────────────────────────────
 LATEX_SYSTEM = (
     "You are a patient electronics tutor for Integrated Electronics "
@@ -37,6 +37,14 @@ LATEX_SYSTEM = (
     "Do not add background unless required. "
     "Provide derivations only if explicitly asked. "
     "Write in short, clean paragraphs. Do not use bullet points or hyphenated lists. "
+
+    "Math formatting rules (very important): "
+    "Whenever you write an equation or formula, write it in LaTeX. "
+    "Use $$ ... $$ for display equations (centered, on their own line) and \\( ... \\) for inline math. "
+    "Use TeX commands, not Unicode symbols (e.g., write \\mu, \\cdot, \\frac{...}{...}). "
+    "Use subscripts/superscripts properly: x_{...}, x^{...}. "
+    "Use C_{ox}, V_{GS}, V_{DS}, V_T, I_{D,\\mathrm{lin}} (or I_{D,lin}) as appropriate. "
+
     "If the question is off-topic, reply exactly: "
     "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
 )
@@ -66,14 +74,62 @@ class LRU(OrderedDict):
 answer_cache = LRU(maxsize=64)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LaTeX sanitizers
+# LaTeX sanitizers + Unicode-to-LaTeX normalization
 # ──────────────────────────────────────────────────────────────────────────────
+def normalize_unicode_math(s: str) -> str:
+    """
+    Convert common Unicode math glyphs into LaTeX-friendly forms.
+    This helps MathJax render consistently like your reference image.
+    """
+    if not s:
+        return s
+
+    # Basic symbol normalization
+    replacements = {
+        "μ": r"\mu",
+        "·": r"\cdot",
+        "×": r"\times",
+        "−": "-",      # unicode minus
+        "–": "-",      # en dash
+        "—": "-",      # em dash
+        "π": r"\pi",
+        "Ω": r"\Omega",
+        "α": r"\alpha",
+        "β": r"\beta",
+        "γ": r"\gamma",
+        "Δ": r"\Delta",
+        "θ": r"\theta",
+        "λ": r"\lambda",
+    }
+    for k, v in replacements.items():
+        s = s.replace(k, v)
+
+    # Superscript digits → ^{digit}
+    s = s.replace("²", r"^{2}")
+    s = s.replace("³", r"^{3}")
+    s = s.replace("⁴", r"^{4}")
+    s = s.replace("⁵", r"^{5}")
+    s = s.replace("⁶", r"^{6}")
+    s = s.replace("⁷", r"^{7}")
+    s = s.replace("⁸", r"^{8}")
+    s = s.replace("⁹", r"^{9}")
+    s = s.replace("⁰", r"^{0}")
+
+    return s
+
 def _collapse_command_backslashes(s: str) -> str:
+    # Convert \\mu, \\frac, \\left, \\[, \\] → \mu, \frac, \left, \[, \]
+    # but DO NOT destroy line breaks like "\\ " or "\\\n".
     s = re.sub(r"\\\\(?=[A-Za-z\[\]])", r"\\", s)
     s = re.sub(r"\\{3,}", r"\\", s)
     return s
 
 def _fix_overescape_in_math(math: str) -> str:
+    """
+    Inside a math block only:
+    - fix \left\[ -> \left[ and \right\] -> \right]
+    - remove stray backslashes before operators/brackets: \= \( \) \[ \] \+ \- \* / ^ _
+    """
     math = math.replace(r"\left\[", r"\left[").replace(r"\right\]", r"\right]")
     math = re.sub(r"\\([=\(\)\[\]\+\-\*/\^_])", r"\1", math)
     return math
@@ -82,13 +138,31 @@ _MATH_DISPLAY = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 _MATH_INLINE  = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
 
 def sanitize_latex(s: str) -> str:
+    """
+    Make model output friendlier to MathJax:
+      • normalize unicode math glyphs into TeX,
+      • collapse \\ before commands/brackets, preserving real line breaks,
+      • strip [6pt]/[8pt]/[12mm]/[0.5em]/etc.,
+      • fix over-escaped punctuation/brackets inside $$...$$ and \(...\).
+    """
+    # 0) Normalize unicode math symbols (μ, ·, ², etc.) into TeX
+    s = normalize_unicode_math(s)
+
+    # 1) Clean backslashes for commands (keep \\ line breaks intact)
     s = _collapse_command_backslashes(s)
+
+    # 2) Remove TeX spacing hints like [6pt], [ 0.5 em ], [12mm], [8px], etc.
     s = re.sub(r"\[\s*\d+(?:\.\d+)?\s*(?:pt|em|ex|mm|cm|in|bp|px)\s*\]", "", s)
 
+    # 3) Clean inside math blocks
     def _fix_display(m): return "$$" + _fix_overescape_in_math(m.group(1)) + "$$"
     def _fix_inline(m):  return r"\(" + _fix_overescape_in_math(m.group(1)) + r"\)"
     s = _MATH_DISPLAY.sub(_fix_display, s)
     s = _MATH_INLINE.sub(_fix_inline, s)
+
+    # 4) Encourage display equations to be on their own line (MathJax renders better)
+    s = re.sub(r"\s*\$\$(.*?)\$\$\s*", lambda m: "\n\n$$" + m.group(1).strip() + "$$\n\n", s, flags=re.DOTALL)
+
     return s
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -103,15 +177,12 @@ def _justify_paragraph(words, width):
     total_chars = sum(len(w) for w in words)
     gaps = len(words) - 1
 
-    # If words alone exceed width, justification is impossible without squeezing spaces to 0.
-    # Keep normal single spaces.
     if total_chars >= width or gaps <= 0:
         return " ".join(words)
 
     spaces_needed = width - total_chars
     space, extra = divmod(spaces_needed, gaps)
 
-    # Guarantee at least 1 space per gap for readability
     if space <= 0:
         return " ".join(words)
 
@@ -129,7 +200,12 @@ def justify_text(text: str) -> str:
         stripped = line.strip()
 
         # Preserve empty lines and math-ish lines exactly (avoid breaking MathJax)
-        if not stripped or "$" in stripped or r"\(" in stripped or r"\)" in stripped:
+        if (
+            not stripped
+            or "$" in stripped
+            or r"\(" in stripped
+            or r"\)" in stripped
+        ):
             output.append(line)
             continue
 
@@ -164,7 +240,6 @@ def split_long_paragraphs(text: str, max_len: int = 300) -> str:
             new_paragraphs.append(p)
             continue
 
-        # Split by sentence boundaries.
         sentences = re.split(r"(?<=[.!?])\s+", p)
         chunk = ""
         for s in sentences:
@@ -194,10 +269,10 @@ def format_reply(s: str) -> str:
     # Normalize blank lines
     s = re.sub(r"\n{3,}", "\n\n", s)
 
-    # NEW: Split dense paragraphs into multiple paragraphs
+    # Split dense paragraphs into multiple paragraphs
     s = split_long_paragraphs(s)
 
-    # Justify safely
+    # Justify safely (note: skip math lines)
     s = justify_text(s)
 
     return s.strip()
